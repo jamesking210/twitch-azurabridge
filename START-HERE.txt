@@ -1,0 +1,63 @@
+Twitch -> AzuraCast Bridge
+linuxbox2 path: /opt/custom-dockers/twitch-azurabridge
+AzuraCast IP: 192.168.1.17
+AzuraCast port: 8005
+AzuraCast mount: /
+
+FIRST INSTALL
+-------------
+sudo su
+mkdir -p /opt/custom-dockers
+cd /opt/custom-dockers
+git clone https://github.com/jamesking210/twitch-azurabridge.git
+cd /opt/custom-dockers/twitch-azurabridge
+cp .env.example .env
+nano .env
+
+docker compose up -d --build
+docker logs -f twitch-azurabridge
+
+NORMAL RESTART
+--------------
+sudo su
+cd /opt/custom-dockers/twitch-azurabridge
+docker compose down
+docker compose up -d --build
+docker logs -f twitch-azurabridge
+
+FULL REFRESH FROM GITHUB
+------------------------
+sudo su
+cd /opt/custom-dockers/twitch-azurabridge
+bash refresh-from-github.sh
+
+TROUBLESHOOT
+------------
+cd /opt/custom-dockers/twitch-azurabridge
+bash doctor.sh
+bash logs.sh
+
+IMPORTANT .env VALUES
+---------------------
+AZURACAST_HOST=192.168.1.17
+AZURACAST_PORT=8005
+AZURACAST_MOUNT=/
+AZURACAST_OUTPUT_MODE=auto
+METADATA_UPDATE_ENABLED=true
+METADATA_SONG_FORMAT={display_name} - {title}
+STREAMLINK_QUALITY=audio_only
+
+WHAT GOOD LOGS LOOK LIKE
+------------------------
+Starting live bridge: ChuckTheDJCA is On Twitch Live ...
+Using AzuraCast streamer username: chuckthedjca
+Using metadata song: ChuckTheDJCA - Tuesday Nite Pop Up
+Updated AzuraCast metadata: ChuckTheDJCA - Tuesday Nite Pop Up
+
+If audio works but public player metadata is wrong, look for:
+Metadata update failed
+
+If metadata auth fails, try this in .env:
+AZURACAST_AUTH_MODE=streamer_login
+
+Then restart.

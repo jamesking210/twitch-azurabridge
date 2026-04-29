@@ -3,12 +3,23 @@
 Twitch -> AzuraCast/Icecast live bridge.
 
 Polls priority Twitch channels, selects the first live channel, pipes audio from
-Streamlink into ffmpeg, and sends it to AzuraCast as a live DJ source.
+Streamlink into ffmpeg, and sends it to AzuraCast as a Streamer/DJ live source.
 
-This version supports AzuraCast's default Streamer/DJ mount of "/" without
-requiring an AzuraCast change. For root mounts, it uses FFmpeg's HTTP PUT output
-instead of FFmpeg's icecast:// protocol, because the icecast protocol refuses a
-plain root mount and throws: "No mountpoint (path) specified!".
+Jim/linuxbox2 defaults:
+  install path: /opt/custom-dockers/twitch-azurabridge
+  AzuraCast host: 192.168.1.17
+  AzuraCast live port: 8005
+  AzuraCast Streamer/DJ mount: /
+
+Root-mount fix:
+  ffmpeg's icecast:// output refuses a plain "/" mount and throws:
+  "No mountpoint (path) specified!". When AZURACAST_MOUNT=/ and
+  AZURACAST_OUTPUT_MODE=auto, this bridge uses HTTP PUT instead.
+
+Metadata fix:
+  AzuraCast may show the correct live DJ but keep stale song/art metadata from
+  the previous source. This bridge now pushes Icecast metadata after connecting
+  and then refreshes it while the Twitch stream is live.
 """
 
 from __future__ import annotations
@@ -74,12 +85,19 @@ def parse_usernames() -> list[str]:
 def require_config() -> None:
     missing = []
     for name in ("TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET", "AZURACAST_HOST", "AZURACAST_PORT"):
-        if not env(name):
+        if not env(name) or env(name).lower() == "changeme":
             missing.append(name)
+
     if not parse_usernames():
         missing.append("TWITCH_USERNAMES")
+
+    for user in parse_usernames():
+        key = env_key_for_username(user)
+        if not env(f"AZURACAST_STREAMER_{key}_PASSWORD") or env(f"AZURACAST_STREAMER_{key}_PASSWORD").lower() == "changeme":
+            missing.append(f"AZURACAST_STREAMER_{key}_PASSWORD")
+
     if missing:
-        raise SystemExit("Missing required config: " + ", ".join(missing))
+        raise SystemExit("Missing required config in .env: " + ", ".join(missing))
 
 
 def azuracast_streamer_username(twitch_username: str) -> str:
@@ -96,7 +114,6 @@ def azuracast_streamer_password(twitch_username: str) -> str:
 
 
 def azuracast_mount() -> str:
-    # User does not want to change AzuraCast. Default to the mount AzuraCast shows: /
     mount = env("AZURACAST_MOUNT", "/") or "/"
     if not mount.startswith("/"):
         mount = "/" + mount
@@ -105,14 +122,15 @@ def azuracast_mount() -> str:
 
 def azuracast_auth(twitch_username: str) -> tuple[str, str]:
     """
-    Build the source login credentials.
+    Build the Icecast/source login credentials.
 
-    Default auth mode is source_password because AzuraCast's Icecast DJ panel
-    commonly shows the password as: dj_username:dj_password.
+    source_password:
+      user=source
+      password=dj_username:dj_password
 
-    Supported modes:
-      source_password  -> user=source, password=dj_username:dj_password
-      streamer_login   -> user=dj_username, password=dj_password
+    streamer_login:
+      user=dj_username
+      password=dj_password
     """
     auth_mode = env("AZURACAST_AUTH_MODE", "source_password").lower()
     streamer_user = azuracast_streamer_username(twitch_username)
@@ -156,8 +174,7 @@ def azuracast_output_url(twitch_username: str) -> str:
     return f"{scheme}://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}{mount}"
 
 
-def safe_ice_header(value: str, max_len: int = 255) -> str:
-    # Prevent accidental header injection and keep Icecast metadata tidy.
+def clean_text(value: str, max_len: int = 255) -> str:
     return value.replace("\r", " ").replace("\n", " ").strip()[:max_len]
 
 
@@ -176,6 +193,33 @@ class SelectedStream:
         category = self.category or "Twitch"
         title = self.title or "Live"
         return f"{self.display_name} is On Twitch Live - {category} - {title}"
+
+    @property
+    def metadata_artist(self) -> str:
+        return clean_text(self.display_name or self.twitch_username)
+
+    @property
+    def metadata_title(self) -> str:
+        title = self.title or "Live on Twitch"
+        if env_bool("METADATA_INCLUDE_CATEGORY_IN_TITLE", False) and self.category:
+            title = f"{self.category} - {title}"
+        return clean_text(title)
+
+    @property
+    def metadata_song(self) -> str:
+        # Icecast metadata is normally one string. AzuraCast parses "Artist - Title".
+        template = env("METADATA_SONG_FORMAT", "{display_name} - {title}") or "{display_name} - {title}"
+        replacements = {
+            "twitch_username": self.twitch_username,
+            "display_name": self.metadata_artist,
+            "title": self.metadata_title,
+            "category": clean_text(self.category or "Twitch"),
+            "viewer_count": str(self.viewer_count),
+        }
+        output = template
+        for key, value in replacements.items():
+            output = output.replace("{" + key + "}", value)
+        return clean_text(output, 512)
 
 
 class TwitchClient:
@@ -216,6 +260,7 @@ class TwitchClient:
         if not usernames:
             return {}
 
+        # Twitch supports up to 100 user_login parameters in one request.
         params: list[tuple[str, str]] = [("user_login", user) for user in usernames[:100]]
         response = requests.get(
             "https://api.twitch.tv/helix/streams",
@@ -245,6 +290,7 @@ class TwitchClient:
             login = normalize_username(item.get("user_login", ""))
             if not login:
                 continue
+
             live[login] = SelectedStream(
                 twitch_username=login,
                 display_name=item.get("user_name") or login,
@@ -257,12 +303,66 @@ class TwitchClient:
         return live
 
 
+def metadata_endpoints() -> list[str]:
+    raw = env("METADATA_ADMIN_ENDPOINTS", "/admin/metadata,/admin/metadata.xsl")
+    endpoints = []
+    for endpoint in raw.split(","):
+        endpoint = endpoint.strip()
+        if not endpoint:
+            continue
+        if not endpoint.startswith("/"):
+            endpoint = "/" + endpoint
+        endpoints.append(endpoint)
+    return endpoints or ["/admin/metadata", "/admin/metadata.xsl"]
+
+
+def update_azuracast_metadata(selected: SelectedStream) -> bool:
+    """Push current Twitch streamer/title to the live source metadata endpoint."""
+    if not env_bool("METADATA_UPDATE_ENABLED", True):
+        return False
+
+    host = env("AZURACAST_HOST", "192.168.1.17")
+    port = env("AZURACAST_PORT", "8005")
+    mount = azuracast_mount()
+    user, password = azuracast_auth(selected.twitch_username)
+    song = selected.metadata_song
+
+    params = {
+        "mount": mount,
+        "mode": "updinfo",
+        "song": song,
+    }
+
+    last_error = ""
+    for endpoint in metadata_endpoints():
+        url = f"http://{host}:{port}{endpoint}"
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                auth=(user, password),
+                timeout=10,
+            )
+            if 200 <= response.status_code < 400:
+                log(f"Updated AzuraCast metadata: {song}")
+                return True
+            body = clean_text(response.text, 140)
+            last_error = f"{endpoint} returned HTTP {response.status_code}: {body}"
+        except requests.RequestException as exc:
+            last_error = f"{endpoint} failed: {exc}"
+
+    log(f"Metadata update failed: {last_error}")
+    return False
+
+
 class BridgeProcess:
     def __init__(self, selected: SelectedStream) -> None:
         self.selected = selected
         self.started_epoch = time.time()
         self.streamlink_proc: Optional[subprocess.Popen[bytes]] = None
         self.ffmpeg_proc: Optional[subprocess.Popen[bytes]] = None
+        self.last_metadata_song = ""
+        self.last_metadata_update_epoch = 0.0
 
     def start(self) -> None:
         stream_url = f"https://www.twitch.tv/{self.selected.twitch_username}"
@@ -278,6 +378,7 @@ class BridgeProcess:
         log(f"Using AzuraCast streamer username: {azuracast_streamer_username(self.selected.twitch_username)}")
         log(f"Using AzuraCast target: {env('AZURACAST_HOST', '192.168.1.17')}:{env('AZURACAST_PORT', '8005')}{azuracast_mount()}")
         log(f"Using AzuraCast output mode: {output_mode}")
+        log(f"Using metadata song: {self.selected.metadata_song}")
 
         streamlink_cmd = [
             "streamlink",
@@ -306,13 +407,20 @@ class BridgeProcess:
             "2",
             "-content_type",
             "audio/mpeg",
+            # Helps some stream parsers pick up Artist/Title at connect time.
+            "-metadata",
+            f"artist={self.selected.metadata_artist}",
+            "-metadata",
+            f"title={self.selected.metadata_title}",
+            "-metadata",
+            f"album={clean_text(self.selected.category or 'Twitch')}",
         ]
 
         if output_mode == "http_put":
             headers = (
-                f"Ice-Name: {safe_ice_header(self.selected.metadata_name)}\r\n"
-                f"Ice-Genre: {safe_ice_header(self.selected.category or 'Twitch')}\r\n"
-                f"Ice-Description: {safe_ice_header(f'Twitch live relay for {self.selected.display_name}')}\r\n"
+                f"Ice-Name: {clean_text(self.selected.metadata_name)}\r\n"
+                f"Ice-Genre: {clean_text(self.selected.category or 'Twitch')}\r\n"
+                f"Ice-Description: {clean_text(f'Twitch live relay for {self.selected.display_name}')}\r\n"
             )
             ffmpeg_cmd.extend([
                 "-method",
@@ -323,11 +431,11 @@ class BridgeProcess:
         else:
             ffmpeg_cmd.extend([
                 "-ice_name",
-                safe_ice_header(self.selected.metadata_name),
+                clean_text(self.selected.metadata_name),
                 "-ice_genre",
-                safe_ice_header(self.selected.category or "Twitch"),
+                clean_text(self.selected.category or "Twitch"),
                 "-ice_description",
-                safe_ice_header(f"Twitch live relay for {self.selected.display_name}"),
+                clean_text(f"Twitch live relay for {self.selected.display_name}"),
             ])
 
         ffmpeg_cmd.extend([
@@ -336,7 +444,6 @@ class BridgeProcess:
             output_url,
         ])
 
-        # New process groups let us stop both child processes cleanly.
         self.streamlink_proc = subprocess.Popen(
             streamlink_cmd,
             stdout=subprocess.PIPE,
@@ -352,6 +459,27 @@ class BridgeProcess:
             preexec_fn=os.setsid,
         )
         self.streamlink_proc.stdout.close()
+
+        # Let the source connect, then push the current title so AzuraCast's public
+        # player doesn't keep stale artist/title/art from the previous source.
+        time.sleep(env_int("METADATA_CONNECT_DELAY_SECONDS", 3))
+        self.maybe_update_metadata(force=True)
+
+    def maybe_update_metadata(self, force: bool = False) -> None:
+        if not env_bool("METADATA_UPDATE_ENABLED", True):
+            return
+
+        now = time.time()
+        interval = max(10, env_int("METADATA_UPDATE_INTERVAL_SECONDS", 30))
+        current_song = self.selected.metadata_song
+
+        if not force:
+            if current_song == self.last_metadata_song and now - self.last_metadata_update_epoch < interval:
+                return
+
+        if update_azuracast_metadata(self.selected):
+            self.last_metadata_song = current_song
+            self.last_metadata_update_epoch = now
 
     def is_running(self) -> bool:
         return bool(
@@ -407,6 +535,7 @@ def main() -> int:
     log(f"Polling Twitch every {poll_seconds} seconds")
     log(f"AzuraCast target: {env('AZURACAST_HOST', '192.168.1.17')}:{env('AZURACAST_PORT', '8005')}{azuracast_mount()}")
     log(f"AzuraCast output mode: {azuracast_output_mode()}")
+    log(f"Metadata updates enabled: {env_bool('METADATA_UPDATE_ENABLED', True)}")
 
     current: Optional[BridgeProcess] = None
     current_identity: Optional[str] = None
@@ -448,6 +577,10 @@ def main() -> int:
                 current.start()
                 current_identity = desired_identity
             else:
+                # Keep metadata fresh even when the Twitch title/category changes without
+                # requiring a full stream restart.
+                current.selected = selected
+                current.maybe_update_metadata()
                 log(f"Already bridging priority channel: {selected.display_name}")
 
             time.sleep(poll_seconds)
