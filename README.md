@@ -68,7 +68,7 @@ This project defaults to:
 ```env
 AZURACAST_HOST=192.168.1.17
 AZURACAST_PORT=8005
-AZURACAST_MOUNT=/radio.mp3
+AZURACAST_MOUNT=/
 ```
 
 Important: `AZURACAST_MOUNT` must match your working live streamer setup. If VirtualDJ is currently working with `/`, use `/`. If it uses `/radio.mp3`, use `/radio.mp3`.
@@ -108,7 +108,7 @@ Clone your GitHub repo:
 
 ```bash
 cd ~
-git clone https://github.com/YOUR-GITHUB-USERNAME/twitch-azurabridge.git
+git clone https://github.com/jamesking210/twitch-azurabridge.git
 cd twitch-azurabridge
 ```
 
@@ -126,7 +126,7 @@ TWITCH_CLIENT_ID=changeme
 TWITCH_CLIENT_SECRET=changeme
 AZURACAST_PASSWORD_JIMBOSLICECHICAGO=changeme
 AZURACAST_PASSWORD_CHUCKTHEDJCA=changeme
-AZURACAST_MOUNT=/radio.mp3
+AZURACAST_MOUNT=/
 ```
 
 Start it:
