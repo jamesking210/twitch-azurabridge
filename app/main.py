@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Twitch → AzuraCast/Icecast bridge.
+Twitch -> AzuraCast/Icecast live bridge.
 
-Monitors Twitch channels in priority order, pulls the first live channel's audio
-with Streamlink, transcodes it with FFmpeg, and pushes it to AzuraCast as a live
-streamer/DJ source.
+Polls priority Twitch channels, selects the first live channel, pipes audio from
+Streamlink into ffmpeg, and sends it to AzuraCast as a live DJ source.
+
+This version supports AzuraCast's default Streamer/DJ mount of "/" without
+requiring an AzuraCast change. For root mounts, it uses FFmpeg's HTTP PUT output
+instead of FFmpeg's icecast:// protocol, because the icecast protocol refuses a
+plain root mount and throws: "No mountpoint (path) specified!".
 """
 
 from __future__ import annotations
@@ -16,82 +20,180 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from datetime import datetime
+from typing import Optional
 from urllib.parse import quote
 
 import requests
 
 
-APP_NAME = "twitch-azurabridge"
-TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
-TWITCH_STREAMS_URL = "https://api.twitch.tv/helix/streams"
-
-
 def log(message: str) -> None:
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {message}", flush=True)
 
 
-def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
-    value = os.getenv(name, default)
-    if required and (value is None or value == ""):
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return "" if value is None else value
+def env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
 
 
-def parse_bool(value: str, default: bool = False) -> bool:
-    if value is None or value == "":
+def env_int(name: str, default: int) -> int:
+    raw = env(name, str(default))
+    try:
+        return int(raw)
+    except ValueError:
+        log(f"Invalid integer for {name}={raw!r}; using {default}")
         return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def channel_env_key(channel: str) -> str:
-    """Make jimboslicechicago -> JIMBOSLICECHICAGO for env var suffixes."""
-    return re.sub(r"[^A-Z0-9]", "", channel.upper())
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = env(name, "true" if default else "false").lower()
+    return raw in {"1", "true", "yes", "y", "on"}
 
 
-def normalize_mount(mount: str) -> str:
-    mount = mount.strip() or "/"
+def normalize_username(username: str) -> str:
+    return username.strip().lower()
+
+
+def env_key_for_username(username: str) -> str:
+    # jimboslicechicago -> JIMBOSLICECHICAGO
+    # chuck-the-dj -> CHUCK_THE_DJ
+    return re.sub(r"[^A-Z0-9]+", "_", username.upper()).strip("_")
+
+
+def parse_usernames() -> list[str]:
+    users = [normalize_username(u) for u in env("TWITCH_USERNAMES").split(",") if u.strip()]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for user in users:
+        if user and user not in seen:
+            ordered.append(user)
+            seen.add(user)
+    return ordered
+
+
+def require_config() -> None:
+    missing = []
+    for name in ("TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET", "AZURACAST_HOST", "AZURACAST_PORT"):
+        if not env(name):
+            missing.append(name)
+    if not parse_usernames():
+        missing.append("TWITCH_USERNAMES")
+    if missing:
+        raise SystemExit("Missing required config: " + ", ".join(missing))
+
+
+def azuracast_streamer_username(twitch_username: str) -> str:
+    key = env_key_for_username(twitch_username)
+    return normalize_username(env(f"AZURACAST_STREAMER_{key}_USERNAME", twitch_username))
+
+
+def azuracast_streamer_password(twitch_username: str) -> str:
+    key = env_key_for_username(twitch_username)
+    password = env(f"AZURACAST_STREAMER_{key}_PASSWORD")
+    if not password:
+        raise RuntimeError(f"Missing AZURACAST_STREAMER_{key}_PASSWORD for {twitch_username}")
+    return password
+
+
+def azuracast_mount() -> str:
+    # User does not want to change AzuraCast. Default to the mount AzuraCast shows: /
+    mount = env("AZURACAST_MOUNT", "/") or "/"
     if not mount.startswith("/"):
         mount = "/" + mount
     return mount
 
 
-def split_csv(value: str) -> List[str]:
-    return [item.strip().lower() for item in value.split(",") if item.strip()]
+def azuracast_auth(twitch_username: str) -> tuple[str, str]:
+    """
+    Build the source login credentials.
+
+    Default auth mode is source_password because AzuraCast's Icecast DJ panel
+    commonly shows the password as: dj_username:dj_password.
+
+    Supported modes:
+      source_password  -> user=source, password=dj_username:dj_password
+      streamer_login   -> user=dj_username, password=dj_password
+    """
+    auth_mode = env("AZURACAST_AUTH_MODE", "source_password").lower()
+    streamer_user = azuracast_streamer_username(twitch_username)
+    streamer_pass = azuracast_streamer_password(twitch_username)
+
+    if auth_mode == "streamer_login":
+        return streamer_user, streamer_pass
+
+    sep = env("AZURACAST_SOURCE_PASSWORD_SEPARATOR", ":") or ":"
+    source_user = env("AZURACAST_SOURCE_USER", "source") or "source"
+    return source_user, f"{streamer_user}{sep}{streamer_pass}"
+
+
+def azuracast_output_mode() -> str:
+    """
+    auto:
+      - root mount / uses HTTP PUT to avoid ffmpeg icecast:// root-mount failure
+      - non-root mounts use icecast://
+    http_put:
+      - always use HTTP PUT
+    icecast:
+      - always use icecast://
+    """
+    requested = env("AZURACAST_OUTPUT_MODE", "auto").lower()
+    if requested not in {"auto", "http_put", "icecast"}:
+        log(f"Invalid AZURACAST_OUTPUT_MODE={requested!r}; using auto")
+        requested = "auto"
+
+    if requested == "auto":
+        return "http_put" if azuracast_mount() == "/" else "icecast"
+    return requested
+
+
+def azuracast_output_url(twitch_username: str) -> str:
+    host = env("AZURACAST_HOST", "192.168.1.17")
+    port = env("AZURACAST_PORT", "8005")
+    mount = azuracast_mount()
+    user, password = azuracast_auth(twitch_username)
+
+    scheme = "http" if azuracast_output_mode() == "http_put" else "icecast"
+    return f"{scheme}://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}{mount}"
+
+
+def safe_ice_header(value: str, max_len: int = 255) -> str:
+    # Prevent accidental header injection and keep Icecast metadata tidy.
+    return value.replace("\r", " ").replace("\n", " ").strip()[:max_len]
 
 
 @dataclass
-class ChannelConfig:
-    twitch_login: str
-    azuracast_user: str
-    azuracast_password: str
-
-
-@dataclass
-class LiveStream:
-    login: str
+class SelectedStream:
+    twitch_username: str
     display_name: str
+    stream_id: str
     title: str
     category: str
-    tags: List[str]
-    viewer_count: Optional[int] = None
+    viewer_count: int
+    started_at: str
+
+    @property
+    def metadata_name(self) -> str:
+        category = self.category or "Twitch"
+        title = self.title or "Live"
+        return f"{self.display_name} is On Twitch Live - {category} - {title}"
 
 
 class TwitchClient:
-    def __init__(self, client_id: str, client_secret: str) -> None:
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self._access_token: Optional[str] = None
-        self._token_expires_at: float = 0
+    def __init__(self) -> None:
+        self.client_id = env("TWITCH_CLIENT_ID")
+        self.client_secret = env("TWITCH_CLIENT_SECRET")
+        self.access_token: Optional[str] = None
+        self.token_expiry_epoch = 0.0
 
-    def _get_token(self) -> str:
-        if self._access_token and time.time() < self._token_expires_at - 60:
-            return self._access_token
+    def get_app_access_token(self) -> str:
+        now = time.time()
+        if self.access_token and now < self.token_expiry_epoch - 300:
+            return self.access_token
 
-        log("Getting Twitch app access token")
+        log("Refreshing Twitch app access token")
         response = requests.post(
-            TWITCH_TOKEN_URL,
-            params={
+            "https://id.twitch.tv/oauth2/token",
+            data={
                 "client_id": self.client_id,
                 "client_secret": self.client_secret,
                 "grant_type": "client_credentials",
@@ -100,124 +202,89 @@ class TwitchClient:
         )
         response.raise_for_status()
         data = response.json()
-        self._access_token = data["access_token"]
-        self._token_expires_at = time.time() + int(data.get("expires_in", 3600))
-        return self._access_token
+        self.access_token = data["access_token"]
+        self.token_expiry_epoch = now + int(data.get("expires_in", 3600))
+        return self.access_token
 
-    def get_live_streams(self, logins: Iterable[str]) -> Dict[str, LiveStream]:
-        login_list = [login.lower() for login in logins]
-        if not login_list:
-            return {}
-
-        token = self._get_token()
-        params: List[Tuple[str, str]] = [("user_login", login) for login in login_list]
-        headers = {
+    def headers(self) -> dict[str, str]:
+        return {
             "Client-ID": self.client_id,
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {self.get_app_access_token()}",
         }
 
-        response = requests.get(TWITCH_STREAMS_URL, params=params, headers=headers, timeout=20)
+    def get_live_streams(self, usernames: list[str]) -> dict[str, SelectedStream]:
+        if not usernames:
+            return {}
+
+        params: list[tuple[str, str]] = [("user_login", user) for user in usernames[:100]]
+        response = requests.get(
+            "https://api.twitch.tv/helix/streams",
+            headers=self.headers(),
+            params=params,
+            timeout=20,
+        )
+
         if response.status_code == 401:
-            # Token may have been revoked/expired early. Refresh once and retry.
-            log("Twitch token rejected, refreshing token")
-            self._access_token = None
-            token = self._get_token()
-            headers["Authorization"] = f"Bearer {token}"
-            response = requests.get(TWITCH_STREAMS_URL, params=params, headers=headers, timeout=20)
+            self.access_token = None
+            response = requests.get(
+                "https://api.twitch.tv/helix/streams",
+                headers=self.headers(),
+                params=params,
+                timeout=20,
+            )
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Ratelimit-Reset")
+            raise RuntimeError(f"Twitch rate limited this bridge. Retry after/reset: {retry_after or 'unknown'}")
 
         response.raise_for_status()
         data = response.json().get("data", [])
 
-        live: Dict[str, LiveStream] = {}
+        live: dict[str, SelectedStream] = {}
         for item in data:
-            login = str(item.get("user_login", "")).lower()
-            tags = item.get("tags") or []
-            live[login] = LiveStream(
-                login=login,
+            login = normalize_username(item.get("user_login", ""))
+            if not login:
+                continue
+            live[login] = SelectedStream(
+                twitch_username=login,
                 display_name=item.get("user_name") or login,
-                title=item.get("title") or "Live Stream",
-                category=item.get("game_name") or "Live",
-                tags=[str(tag) for tag in tags],
-                viewer_count=item.get("viewer_count"),
+                stream_id=item.get("id") or "",
+                title=item.get("title") or "Live",
+                category=item.get("game_name") or "Twitch",
+                viewer_count=int(item.get("viewer_count") or 0),
+                started_at=item.get("started_at") or "",
             )
         return live
 
 
 class BridgeProcess:
-    def __init__(self) -> None:
-        self.streamlink_proc: Optional[subprocess.Popen] = None
-        self.ffmpeg_proc: Optional[subprocess.Popen] = None
-        self.current_login: Optional[str] = None
+    def __init__(self, selected: SelectedStream) -> None:
+        self.selected = selected
+        self.started_epoch = time.time()
+        self.streamlink_proc: Optional[subprocess.Popen[bytes]] = None
+        self.ffmpeg_proc: Optional[subprocess.Popen[bytes]] = None
 
-    def running(self) -> bool:
-        if not self.ffmpeg_proc:
-            return False
-        return self.ffmpeg_proc.poll() is None
+    def start(self) -> None:
+        stream_url = f"https://www.twitch.tv/{self.selected.twitch_username}"
+        quality = env("STREAMLINK_QUALITY", "audio_only") or "audio_only"
+        streamlink_loglevel = env("STREAMLINK_LOGLEVEL", "info") or "info"
+        ffmpeg_loglevel = env("FFMPEG_LOGLEVEL", "warning") or "warning"
+        audio_bitrate = env("AUDIO_BITRATE", "128k") or "128k"
+        audio_sample_rate = env("AUDIO_SAMPLE_RATE", "44100") or "44100"
+        output_url = azuracast_output_url(self.selected.twitch_username)
+        output_mode = azuracast_output_mode()
 
-    def stop(self) -> None:
-        if not self.streamlink_proc and not self.ffmpeg_proc:
-            return
-
-        log("Stopping current Twitch → AzuraCast bridge")
-        for proc in [self.ffmpeg_proc, self.streamlink_proc]:
-            if proc and proc.poll() is None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            all_done = True
-            for proc in [self.ffmpeg_proc, self.streamlink_proc]:
-                if proc and proc.poll() is None:
-                    all_done = False
-            if all_done:
-                break
-            time.sleep(0.25)
-
-        for proc in [self.ffmpeg_proc, self.streamlink_proc]:
-            if proc and proc.poll() is None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-        self.streamlink_proc = None
-        self.ffmpeg_proc = None
-        self.current_login = None
-
-    def start(self, stream: LiveStream, channel_cfg: ChannelConfig, settings: Dict[str, str]) -> None:
-        self.stop()
-
-        host = settings["az_host"]
-        port = settings["az_port"]
-        mount = settings["az_mount"]
-        bitrate = settings["bitrate"]
-        quality = settings["quality"]
-        public = settings["icecast_public"]
-        audio_format = settings["audio_format"].lower()
-        sample_rate = settings["sample_rate"]
-        channels = settings["channels"]
-        metadata = format_metadata(stream, settings["metadata_template"])
-
-        if audio_format != "mp3":
-            raise RuntimeError("Only mp3 output is currently supported by this starter project.")
-
-        user = quote(channel_cfg.azuracast_user, safe="")
-        password = quote(channel_cfg.azuracast_password, safe="")
-        mount_escaped = quote(mount.lstrip("/"), safe="/")
-        icecast_url = f"icecast://{user}:{password}@{host}:{port}/{mount_escaped}"
-
-        twitch_url = f"https://www.twitch.tv/{stream.login}"
+        log(f"Starting live bridge: {self.selected.metadata_name}")
+        log(f"Using AzuraCast streamer username: {azuracast_streamer_username(self.selected.twitch_username)}")
+        log(f"Using AzuraCast target: {env('AZURACAST_HOST', '192.168.1.17')}:{env('AZURACAST_PORT', '8005')}{azuracast_mount()}")
+        log(f"Using AzuraCast output mode: {output_mode}")
 
         streamlink_cmd = [
             "streamlink",
+            "--loglevel",
+            streamlink_loglevel,
             "--stdout",
-            "--twitch-disable-ads",
-            "--retry-streams",
-            "10",
-            twitch_url,
+            stream_url,
             quality,
         ]
 
@@ -225,194 +292,179 @@ class BridgeProcess:
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
-            settings["ffmpeg_loglevel"],
-            "-re",
+            ffmpeg_loglevel,
             "-i",
             "pipe:0",
             "-vn",
-            "-ac",
-            channels,
-            "-ar",
-            sample_rate,
-            "-c:a",
+            "-acodec",
             "libmp3lame",
             "-b:a",
-            bitrate,
+            audio_bitrate,
+            "-ar",
+            audio_sample_rate,
+            "-ac",
+            "2",
             "-content_type",
             "audio/mpeg",
-            "-ice_name",
-            metadata,
-            "-ice_description",
-            metadata,
-            "-ice_genre",
-            stream.category,
-            "-ice_public",
-            public,
-            "-metadata",
-            f"artist={stream.display_name}",
-            "-metadata",
-            f"title={metadata}",
-            "-f",
-            "mp3",
-            icecast_url,
         ]
 
-        log(f"Starting live bridge: {metadata}")
-        log(f"Using AzuraCast streamer username: {channel_cfg.azuracast_user}")
+        if output_mode == "http_put":
+            headers = (
+                f"Ice-Name: {safe_ice_header(self.selected.metadata_name)}\r\n"
+                f"Ice-Genre: {safe_ice_header(self.selected.category or 'Twitch')}\r\n"
+                f"Ice-Description: {safe_ice_header(f'Twitch live relay for {self.selected.display_name}')}\r\n"
+            )
+            ffmpeg_cmd.extend([
+                "-method",
+                "PUT",
+                "-headers",
+                headers,
+            ])
+        else:
+            ffmpeg_cmd.extend([
+                "-ice_name",
+                safe_ice_header(self.selected.metadata_name),
+                "-ice_genre",
+                safe_ice_header(self.selected.category or "Twitch"),
+                "-ice_description",
+                safe_ice_header(f"Twitch live relay for {self.selected.display_name}"),
+            ])
 
+        ffmpeg_cmd.extend([
+            "-f",
+            "mp3",
+            output_url,
+        ])
+
+        # New process groups let us stop both child processes cleanly.
         self.streamlink_proc = subprocess.Popen(
             streamlink_cmd,
             stdout=subprocess.PIPE,
-            stderr=sys.stderr,
-            stdin=subprocess.DEVNULL,
+            stderr=None,
+            preexec_fn=os.setsid,
         )
 
-        if self.streamlink_proc.stdout is None:
-            raise RuntimeError("Streamlink did not provide stdout pipe")
-
+        assert self.streamlink_proc.stdout is not None
         self.ffmpeg_proc = subprocess.Popen(
             ffmpeg_cmd,
             stdin=self.streamlink_proc.stdout,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
+            stderr=None,
+            preexec_fn=os.setsid,
+        )
+        self.streamlink_proc.stdout.close()
+
+    def is_running(self) -> bool:
+        return bool(
+            self.streamlink_proc
+            and self.ffmpeg_proc
+            and self.streamlink_proc.poll() is None
+            and self.ffmpeg_proc.poll() is None
         )
 
-        # Let ffmpeg own the pipe; this allows streamlink to get SIGPIPE if ffmpeg exits.
-        self.streamlink_proc.stdout.close()
-        self.current_login = stream.login
+    def stopped_quickly(self) -> bool:
+        return time.time() - self.started_epoch < 20
+
+    def stop(self) -> None:
+        log("Stopping current Twitch → AzuraCast bridge")
+        for proc in (self.ffmpeg_proc, self.streamlink_proc):
+            if proc and proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        time.sleep(2)
+        for proc in (self.ffmpeg_proc, self.streamlink_proc):
+            if proc and proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
-def format_metadata(stream: LiveStream, template: str) -> str:
-    tags = ", ".join(stream.tags)
-    metadata = template.format(
-        login=stream.login,
-        display_name=stream.display_name,
-        title=stream.title,
-        category=stream.category,
-        tags=tags,
-    )
-    # Keep metadata compact and avoid line breaks that can confuse Icecast clients.
-    metadata = re.sub(r"\s+", " ", metadata).strip()
-    max_len = int(env("METADATA_MAX_LENGTH", "180"))
-    if len(metadata) > max_len:
-        metadata = metadata[: max_len - 1].rstrip() + "…"
-    return metadata
+def choose_priority_stream(priority_usernames: list[str], live: dict[str, SelectedStream]) -> Optional[SelectedStream]:
+    for username in priority_usernames:
+        if username in live:
+            return live[username]
+    return None
 
 
-def load_config() -> Tuple[List[ChannelConfig], Dict[str, str]]:
-    priority = split_csv(env("TWITCH_PRIORITY", required=True))
-    if not priority:
-        raise RuntimeError("TWITCH_PRIORITY must include at least one Twitch channel")
-
-    channel_configs: List[ChannelConfig] = []
-    for login in priority:
-        key = channel_env_key(login)
-        user = env(f"AZURACAST_USER_{key}", required=True)
-        password = env(f"AZURACAST_PASSWORD_{key}", required=True)
-        if login != login.lower():
-            raise RuntimeError(f"Twitch channel must be lowercase in TWITCH_PRIORITY: {login}")
-        if user != user.lower():
-            raise RuntimeError(f"AzuraCast username should be lowercase for {login}: {user}")
-        channel_configs.append(ChannelConfig(login, user, password))
-
-    settings = {
-        "az_host": env("AZURACAST_HOST", "192.168.1.17"),
-        "az_port": env("AZURACAST_PORT", "8005"),
-        "az_mount": normalize_mount(env("AZURACAST_MOUNT", "/radio.mp3")),
-        "bitrate": env("AZURACAST_BITRATE", "192k"),
-        "audio_format": env("AZURACAST_FORMAT", "mp3"),
-        "sample_rate": env("AUDIO_SAMPLE_RATE", "44100"),
-        "channels": env("AUDIO_CHANNELS", "2"),
-        "quality": env("TWITCH_QUALITY", "best"),
-        "icecast_public": "1" if parse_bool(env("AZURACAST_ICECAST_PUBLIC", "0")) else "0",
-        "metadata_template": env(
-            "METADATA_TEMPLATE",
-            "{display_name} is On Twitch Live - {category} - {title}",
-        ),
-        "ffmpeg_loglevel": env("FFMPEG_LOGLEVEL", "warning"),
-    }
-    return channel_configs, settings
+def stream_identity(selected: SelectedStream) -> str:
+    if env_bool("RESTART_ON_METADATA_CHANGE", False):
+        return f"{selected.twitch_username}|{selected.stream_id}|{selected.title}|{selected.category}"
+    return f"{selected.twitch_username}|{selected.stream_id}"
 
 
 def main() -> int:
-    log(f"Starting {APP_NAME}")
+    require_config()
 
-    client_id = env("TWITCH_CLIENT_ID", required=True)
-    client_secret = env("TWITCH_CLIENT_SECRET", required=True)
-    poll_seconds = int(env("TWITCH_POLL_SECONDS", "30"))
-    switch_on_higher_priority = parse_bool(env("SWITCH_TO_HIGHER_PRIORITY_WHILE_LIVE", "1"), True)
-    stop_when_offline = parse_bool(env("STOP_WHEN_SELECTED_CHANNEL_OFFLINE", "1"), True)
+    priority_usernames = parse_usernames()
+    poll_seconds = env_int("TWITCH_POLL_SECONDS", 30)
+    backoff_seconds = env_int("BRIDGE_BACKOFF_SECONDS", 120)
+    twitch = TwitchClient()
 
-    channel_configs, settings = load_config()
-    channel_by_login = {cfg.twitch_login: cfg for cfg in channel_configs}
-    priority_logins = [cfg.twitch_login for cfg in channel_configs]
+    log("Twitch → AzuraCast bridge starting")
+    log(f"Priority order: {', '.join(priority_usernames)}")
+    log(f"Polling Twitch every {poll_seconds} seconds")
+    log(f"AzuraCast target: {env('AZURACAST_HOST', '192.168.1.17')}:{env('AZURACAST_PORT', '8005')}{azuracast_mount()}")
+    log(f"AzuraCast output mode: {azuracast_output_mode()}")
 
-    log("Priority order: " + " > ".join(priority_logins))
-    log(f"AzuraCast target: {settings['az_host']}:{settings['az_port']}{settings['az_mount']}")
+    current: Optional[BridgeProcess] = None
+    current_identity: Optional[str] = None
+    backoff_until = 0.0
 
-    twitch = TwitchClient(client_id, client_secret)
-    bridge = BridgeProcess()
-    shutdown = False
-
-    def handle_signal(signum, frame):  # noqa: ANN001
-        nonlocal shutdown
-        log(f"Received signal {signum}, shutting down")
-        shutdown = True
-        bridge.stop()
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
-    while not shutdown:
+    while True:
         try:
-            live_map = twitch.get_live_streams(priority_logins)
-            selected: Optional[LiveStream] = None
-            for login in priority_logins:
-                if login in live_map:
-                    selected = live_map[login]
-                    break
+            if current and not current.is_running():
+                log("Current bridge process ended")
+                quick = current.stopped_quickly()
+                current.stop()
+                current = None
+                current_identity = None
+                if quick:
+                    backoff_until = time.time() + backoff_seconds
+                    log(f"Bridge stopped quickly; backing off for {backoff_seconds} seconds")
 
-            if selected:
-                if bridge.running():
-                    if bridge.current_login == selected.login:
-                        log(f"Still live: {selected.display_name}")
-                    elif switch_on_higher_priority:
-                        bridge.start(selected, channel_by_login[selected.login], settings)
-                    else:
-                        log(
-                            f"{selected.display_name} is live, but keeping current stream: "
-                            f"{bridge.current_login}"
-                        )
-                else:
-                    bridge.start(selected, channel_by_login[selected.login], settings)
+            if time.time() < backoff_until:
+                time.sleep(min(10, max(1, int(backoff_until - time.time()))))
+                continue
+
+            live = twitch.get_live_streams(priority_usernames)
+            selected = choose_priority_stream(priority_usernames, live)
+
+            if not selected:
+                if current:
+                    current.stop()
+                    current = None
+                    current_identity = None
+                log("No priority Twitch channels are live")
+                time.sleep(poll_seconds)
+                continue
+
+            desired_identity = stream_identity(selected)
+            if not current or current_identity != desired_identity:
+                if current:
+                    current.stop()
+                current = BridgeProcess(selected)
+                current.start()
+                current_identity = desired_identity
             else:
-                if bridge.running() and stop_when_offline:
-                    log("No priority Twitch channels are live. Disconnecting so AzuraCast can fall back to AutoDJ.")
-                    bridge.stop()
-                else:
-                    log("No priority Twitch channels are live")
+                log(f"Already bridging priority channel: {selected.display_name}")
 
-            # If streamlink/ffmpeg died, clean up so next loop can retry if still live.
-            if bridge.ffmpeg_proc and bridge.ffmpeg_proc.poll() is not None:
-                log(f"FFmpeg exited with code {bridge.ffmpeg_proc.returncode}")
-                bridge.stop()
-            if bridge.streamlink_proc and bridge.streamlink_proc.poll() is not None:
-                log(f"Streamlink exited with code {bridge.streamlink_proc.returncode}")
-                bridge.stop()
+            time.sleep(poll_seconds)
 
+        except KeyboardInterrupt:
+            if current:
+                current.stop()
+            log("Bridge stopped")
+            return 0
         except Exception as exc:
             log(f"ERROR: {exc}")
-            bridge.stop()
-
-        for _ in range(max(1, poll_seconds)):
-            if shutdown:
-                break
-            time.sleep(1)
-
-    bridge.stop()
-    log("Exited")
-    return 0
+            if current:
+                current.stop()
+                current = None
+                current_identity = None
+            time.sleep(backoff_seconds)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

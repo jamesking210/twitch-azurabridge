@@ -1,267 +1,160 @@
 # Twitch → AzuraCast Bridge
 
-A small Docker project that monitors Twitch channels in priority order, pulls the first live channel's audio, and rebroadcasts it to AzuraCast/Icecast as a live streamer/DJ source.
+This Docker project polls priority Twitch channels and relays the first live channel into AzuraCast as a Streamer/DJ live source.
 
-This starter version does **not** require the AzuraCast API. It connects to AzuraCast the same way a DJ encoder like VirtualDJ, Mixxx, BUTT, or Rocket Broadcaster would connect.
+Current defaults are set for:
 
-## What it does
+- AzuraCast host: `192.168.1.17`
+- AzuraCast live port: `8005`
+- AzuraCast Streamer/DJ mount: `/`
+- Priority order: `jimboslicechicago`, then `chuckthedjca`
 
-- Monitors Twitch channels in lowercase priority order.
-- If `jimboslicechicago` and `chuckthedjca` are both live, `jimboslicechicago` wins.
-- Pulls Twitch audio using Streamlink.
-- Transcodes to MP3 with FFmpeg.
-- Pushes to AzuraCast/Icecast using the matching streamer username/password.
-- Sends text metadata like:
+## What changed in this version
 
-```text
-JimboSliceChicago is On Twitch Live - Music - Dance EDM 2000s
-```
+You said you do **not** want to change anything in AzuraCast.
 
-## What it does not do yet
-
-- It does not use the AzuraCast API.
-- It does not automatically upload or change AzuraCast artwork.
-- It does not manage schedules.
-- It does not restream video, only audio.
-
-For artwork, the recommended setup is to manually configure each AzuraCast streamer/DJ account with its own avatar/artwork inside AzuraCast.
-
-## Files
+Your AzuraCast screen shows:
 
 ```text
-.
-├── app/main.py
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
-├── .gitignore
-├── requirements.txt
-└── README.md
+Mount Name: /
+Port: 8005
 ```
 
-## Setup overview
-
-You need:
-
-1. AzuraCast reachable from `linuxbox2`.
-2. AzuraCast streamer/DJ accounts created, for example:
-   - `jimbo_twitch`
-   - `chuck_twitch`
-3. Twitch Developer app credentials:
-   - `TWITCH_CLIENT_ID`
-   - `TWITCH_CLIENT_SECRET`
-4. Docker and Docker Compose on `linuxbox2`.
-
-## AzuraCast setup
-
-Create two lowercase streamer/DJ accounts in AzuraCast:
+The earlier broken pipe came from ffmpeg trying to use this URL shape:
 
 ```text
-jimbo_twitch
-chuck_twitch
+icecast://user:password@192.168.1.17:8005/
 ```
 
-Use whatever passwords you want in AzuraCast, then put those same passwords in `.env`.
+ffmpeg's `icecast://` output treats a plain `/` root mount as no mountpoint and fails with:
 
-This project defaults to:
-
-```env
-AZURACAST_HOST=192.168.1.17
-AZURACAST_PORT=8005
-AZURACAST_MOUNT=/
+```text
+No mountpoint (path) specified!
+Broken pipe
 ```
 
-Important: `AZURACAST_MOUNT` must match your working live streamer setup. If VirtualDJ is currently working with `/`, use `/`. If it uses `/radio.mp3`, use `/radio.mp3`.
+This version keeps AzuraCast's mount as `/`, but automatically uses **HTTP PUT** for the root mount instead of ffmpeg's `icecast://` protocol.
 
-## Twitch API setup
+So you should not need to change the AzuraCast mount to `/live`.
 
-Create a Twitch app in the Twitch Developer Console and copy the Client ID and Client Secret into `.env`.
-
-This project uses a Twitch app access token. It does not require each DJ to log in.
-
-## Deploy on linuxbox2 from scratch
-
-SSH into `linuxbox2`:
+## Install
 
 ```bash
-ssh jim@linuxbox2
-```
-
-Install Docker if needed:
-
-```bash
-sudo apt update
-sudo apt install -y ca-certificates curl gnupg
-sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-sudo chmod a+r /etc/apt/keyrings/docker.gpg
-. /etc/os-release
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo usermod -aG docker $USER
-```
-
-Log out and back in so your user can run Docker without `sudo`.
-
-Clone your GitHub repo:
-
-```bash
-cd ~
-git clone https://github.com/jamesking210/twitch-azurabridge.git
+cd /opt/custom-dockers
+unzip twitch-azurabridge-root-mount.zip
 cd twitch-azurabridge
-```
-
-Create your private `.env`:
-
-```bash
 cp .env.example .env
 nano .env
 ```
 
-Edit these values at minimum:
+Fill in:
 
 ```env
-TWITCH_CLIENT_ID=changeme
-TWITCH_CLIENT_SECRET=changeme
-AZURACAST_PASSWORD_JIMBOSLICECHICAGO=changeme
-AZURACAST_PASSWORD_CHUCKTHEDJCA=changeme
-AZURACAST_MOUNT=/
+TWITCH_CLIENT_ID=your_client_id
+TWITCH_CLIENT_SECRET=your_client_secret
+AZURACAST_STREAMER_JIMBOSLICECHICAGO_PASSWORD=your_jimbo_dj_password
+AZURACAST_STREAMER_CHUCKTHEDJCA_PASSWORD=your_chuck_dj_password
 ```
 
 Start it:
 
 ```bash
 docker compose up -d --build
+docker logs -f twitch-azurabridge
 ```
 
-Watch logs:
+## Default `.env` settings for your AzuraCast box
 
-```bash
-docker compose logs -f
+```env
+AZURACAST_HOST=192.168.1.17
+AZURACAST_PORT=8005
+AZURACAST_MOUNT=/
+AZURACAST_OUTPUT_MODE=auto
 ```
 
-Stop it:
+`AZURACAST_OUTPUT_MODE=auto` means:
+
+```text
+If mount is /      -> use HTTP PUT
+If mount is /live  -> use icecast://
+```
+
+## Auth mode note
+
+The default is:
+
+```env
+AZURACAST_AUTH_MODE=source_password
+AZURACAST_SOURCE_USER=source
+AZURACAST_SOURCE_PASSWORD_SEPARATOR=:
+```
+
+That builds the Icecast password the way AzuraCast shows it for Streamer/DJ accounts:
+
+```text
+dj_username:dj_password
+```
+
+If your AzuraCast setup only works with the streamer username and streamer password as normal login fields, change this:
+
+```env
+AZURACAST_AUTH_MODE=streamer_login
+```
+
+Then restart:
 
 ```bash
 docker compose down
+docker compose up -d --build
 ```
 
-Restart it:
+## Local IP note
 
-```bash
-docker compose restart
+Use this for your setup:
+
+```env
+AZURACAST_HOST=192.168.1.17
 ```
 
-## Upload this project to GitHub
-
-From the project folder on your computer or on `linuxbox2`:
-
-```bash
-git init
-git add .
-git commit -m "Initial Twitch AzuraCast bridge"
-git branch -M main
-git remote add origin https://github.com/YOUR-GITHUB-USERNAME/twitch-azurabridge.git
-git push -u origin main
-```
-
-Do not commit `.env`. It is already ignored by `.gitignore`.
+Do not use `localhost` unless the bridge container is running in host networking. Inside Docker, `localhost` usually means the bridge container itself, not your AzuraCast host.
 
 ## Priority behavior
 
-Priority is controlled here:
+This line controls priority:
 
 ```env
-TWITCH_PRIORITY=jimboslicechicago,chuckthedjca
+TWITCH_USERNAMES=jimboslicechicago,chuckthedjca
 ```
 
-That means:
+The first live channel wins. If both are live, `jimboslicechicago` wins and `chuckthedjca` is ignored until Jimbo goes offline.
 
-```text
-1. If jimboslicechicago is live, play Jimbo.
-2. If Jimbo is offline and chuckthedjca is live, play Chuck.
-3. If both are live, Jimbo wins.
-4. If nobody is live, disconnect and AzuraCast AutoDJ should resume.
-```
-
-## Metadata format
-
-Controlled by:
-
-```env
-METADATA_TEMPLATE={display_name} is On Twitch Live - {category} - {title}
-```
-
-Available fields:
-
-```text
-{login}
-{display_name}
-{category}
-{title}
-{tags}
-```
-
-Examples:
-
-```text
-JimboSliceChicago is On Twitch Live - Music - Dance EDM 2000s
-ChuckTheDJCA is On Twitch Live - DJ - Yacht Rock Music
-```
-
-Text metadata support depends on how AzuraCast/Icecast handles metadata from a live source. This bridge attempts to pass metadata through FFmpeg using Icecast headers and stream metadata. If you later want richer now-playing behavior, add the AzuraCast API.
-
-## Troubleshooting
-
-### It says no channels are live
-
-Check:
+## Useful commands
 
 ```bash
-docker compose logs -f
+docker logs -f twitch-azurabridge
+docker compose restart
+docker compose down
+docker compose up -d --build
 ```
 
-Make sure:
-
-- Twitch Client ID and Secret are correct.
-- Twitch usernames in `TWITCH_PRIORITY` are lowercase and spelled correctly.
-- The Twitch channels are actually live.
-
-### It sees Twitch live but AzuraCast does not play it
-
-Check:
-
-- `AZURACAST_HOST=192.168.1.17`
-- `AZURACAST_PORT=8005`
-- `AZURACAST_MOUNT` matches your working VirtualDJ setup.
-- The AzuraCast streamer username/password matches exactly.
-- The streamer account is enabled in AzuraCast.
-- Live streaming is enabled for the station.
-
-### The Docker keeps reconnecting
-
-Possible causes:
-
-- Twitch stream went offline.
-- Wrong AzuraCast mount.
-- Wrong AzuraCast streamer password.
-- AzuraCast live port is not reachable from `linuxbox2`.
-- Another live source is already connected and AzuraCast is rejecting this one.
-
-### Test network access from linuxbox2
+Check port reachability from the host:
 
 ```bash
-ping 192.168.1.17
 nc -vz 192.168.1.17 8005
 ```
 
-If `nc` is not installed:
+## If it still fails
 
-```bash
-sudo apt install -y netcat-openbsd
+Try this one-line `.env` change first:
+
+```env
+AZURACAST_AUTH_MODE=streamer_login
 ```
 
-## Safety notes
+Then rebuild/restart:
 
-Only rebroadcast Twitch streams you own or have permission to rebroadcast. This tool is meant for your own DJMIXHUB workflow and approved DJs.
+```bash
+docker compose down
+docker compose up -d --build
+docker logs -f twitch-azurabridge
+```
