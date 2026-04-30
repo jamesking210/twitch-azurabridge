@@ -1,13 +1,20 @@
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    STREAMLINK_WEBBROWSER_EXECUTABLE=/usr/bin/chromium \
+    STREAMLINK_WEBBROWSER_HEADLESS=1 \
+    STREAMLINK_WEBBROWSER_TIMEOUT=90
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         ca-certificates \
         tini \
+        chromium \
+        xvfb \
+        xauth \
+        fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
